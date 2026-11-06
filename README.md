@@ -154,6 +154,7 @@
 4. **HIL-тест (ідеальний):** `python main.py ai --target 15.0 --plot` (Зупинка Ctrl+C).
 5. **HIL-тест (насичення):** `python main.py ai --target 21.0 --plot`
 6. **Аналіз:** `python main.py analyze --file logs/ai_telemetry_...csv --save logs/fig.png`
+6. **Порівняння двох файлів з даними:** `python main.py compare --file1 logs\ФАЙЛ_1.csv --file2 logs\ФАЙЛ_2.csv --save logs/COMPARE.png` 
 
 ---
 

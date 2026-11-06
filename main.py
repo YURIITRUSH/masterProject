@@ -451,7 +451,45 @@ class Analyzer:
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
         print(f"✅ Графік успішно збережено: {save_path}")
-
+        
+    @staticmethod
+    def compare(file1: str, file2: str, save_path: str = "logs/comparison.png"):
+        """Накладання графіків двох файлів на одне полотно."""
+        print(f"📊 Порівняння: {Path(file1).name} vs {Path(file2).name}...")
+        
+        df_b = pd.read_csv(file1)
+        df_a = pd.read_csv(file2)
+        
+        # Конвертація часу в секунди від початку
+        t_b = (pd.to_datetime(df_b['Timestamp']) - pd.to_datetime(df_b['Timestamp']).iloc[0]).dt.total_seconds().values
+        t_a = (pd.to_datetime(df_a['Timestamp']) - pd.to_datetime(df_a['Timestamp']).iloc[0]).dt.total_seconds().values
+        
+        plt.style.use('seaborn-v0_8-whitegrid')
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        
+        # --- Верхній графік: Швидкість ---
+        ax1.plot(t_b, df_b['Omega'], 'b-', linewidth=2, alpha=0.7, label='Baseline (Ручний PID)')
+        ax1.plot(t_a, df_a['Omega'], 'r-', linewidth=2, label='Neural Gain Scheduling (ШІ)')
+        
+        # Малюємо цільову лінію (беремо з Baseline, бо вона однакова)
+        ax1.plot(t_b, df_b['Target'], 'k--', linewidth=1.5, alpha=0.6, label='Цільова швидкість')
+        
+        ax1.set_ylabel('Швидкість (рад/с)', fontsize=12)
+        ax1.legend(loc='lower right', fontsize=11)
+        ax1.grid(True, linestyle=':')
+        ax1.set_title('Порівняння перехідних процесів: Ручний PID vs Нейромережа', fontsize=14, fontweight='bold')
+        
+        # --- Нижній графік: ШІМ (Енергоспоживання) ---
+        ax2.plot(t_b, df_b['PWM'], 'b-', linewidth=1.5, alpha=0.7, label='Baseline (Ручний PID)')
+        ax2.plot(t_a, df_a['PWM'], 'g-', linewidth=2, label='Neural Gain Scheduling (ШІ)')
+        ax2.set_ylabel('ШІМ (0-255)', fontsize=12)
+        ax2.set_xlabel('Час (с)', fontsize=12)
+        ax2.legend(loc='lower right', fontsize=11)
+        ax2.grid(True, linestyle=':')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        print(f"✅ Порівняльний графік збережено: {save_path}")
 # ============================================================================
 # 4. ГОЛОВНИЙ КОНТРОЛЕР (CLI - Інтерфейс командного рядка)
 # ============================================================================
@@ -485,7 +523,13 @@ if __name__ == "__main__":
     p_ana = subs.add_parser("analyze", help="Побудова графіків за існуючим логом")
     p_ana.add_argument("--file", default=None, help="Шлях до CSV-файлу")
     p_ana.add_argument("--save", default="logs/final_ai_result.png", help="Шлях для збереження PNG")
-
+    
+    # Команда compare
+    p_cmp = subs.add_parser("compare", help="Накладання двох графіків для порівняння")
+    p_cmp.add_argument("--file1", required=True, help="Шлях до CSV 1")
+    p_cmp.add_argument("--file2", required=True, help="Шлях до CSV 2")
+    p_cmp.add_argument("--save", default="logs/comparison.png", help="Шлях для збереження")
+    
     args = parser.parse_args()
 
     # Маршрутизація команд
@@ -497,5 +541,7 @@ if __name__ == "__main__":
         AITrainer.run(args.max_target)
     elif args.cmd == "ai": 
         HILController.run(args.target, args.port, args.plot)
-    elif args.cmd == "analyze": 
+    elif args.cmd == "analyze":
         Analyzer.run(args.file, args.save)
+    elif args.cmd == "compare":
+        Analyzer.compare(args.file1, args.file2, args.save)
