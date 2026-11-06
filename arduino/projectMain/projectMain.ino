@@ -26,8 +26,7 @@ namespace Config {
     constexpr uint8_t PIN_ENC_A = 2;
     constexpr uint8_t PIN_ENC_B = 9;
 
-    // 7 імпульсів/оберт × 4 (квадратурне x4) × 150 (редуктор) = 4200
-    constexpr float TICKS_PER_REV = 4200.0f;
+    constexpr float TICKS_PER_REV = 2100.0f;
 
     constexpr uint8_t INA219_I2C_ADDR = 0x40;
 
@@ -294,10 +293,62 @@ public:
             }
         }
     }
+    void turnTicks(long n, int pwm) {
+        if (n == 0) return;
+        pwm = constrain(pwm, 40, 255);
 
-    // Формат: Current_A,Omega,Target,PWM,Ticks,dTicks
+        _pbc.is_active = false;
+        _pbc.resetAll();
+
+        const long goal = labs(n);
+        const long start = _encoder.getRawTicks();
+        const MotorDriver::Direction dir =
+            (n > 0) ? MotorDriver::Direction::FORWARD
+                    : MotorDriver::Direction::BACKWARD;
+
+        Serial.print(F("[TURN] start=")); Serial.print(start);
+        Serial.print(F(" goal=")); Serial.print(goal);
+        Serial.print(F(" pwm=")); Serial.println(pwm);
+
+        const unsigned long t0 = millis();
+        bool slow = false;
+        _motor.drive(dir, pwm);
+
+        while (true) {
+            long done = labs(_encoder.getRawTicks() - start);
+            if (done >= goal) break;
+
+            if (millis() - t0 > 15000) {
+                Serial.println(F("[TURN] Timeout (15 s)."));
+                break;
+            }
+            if (millis() - t0 > 2000 && done == 0) {
+                Serial.println(F("[TURN] Вал не рухнувся. Збільште ШІМ (напр. turn 4200 120)."));
+                break;
+            }
+            // Останні 200 тіків — повільніше, щоб менше «пролетіти»
+            if (!slow && (goal - done) < 200) {
+                _motor.drive(dir, max(40, pwm * 2 / 3));
+                slow = true;
+            }
+            delay(1);
+        }
+
+        _motor.stop();
+        delay(500);   // дати валу докотитися
+
+        const long endTicks = _encoder.getRawTicks();
+        const long delta = endTicks - start;
+        Serial.print(F("[TURN] end=")); Serial.print(endTicks);
+        Serial.print(F(" delta=")); Serial.print(delta);
+        Serial.print(F(" overshoot=")); Serial.println(labs(delta) - goal);
+    }
+
+
+    // Формат: Current_A,Voltage,Omega,Target,PWM,Ticks,dTicks
     void sendTelemetryCSV() {
         Serial.print(_power.getCurrentAmps(), 3); Serial.print(',');
+        Serial.print(_power.getVoltageVolts(), 2); Serial.print(','); // <--- ДОДАНО НАПРУГУ
         Serial.print(_encoder.getOmega(), 2); Serial.print(',');
         Serial.print(_pbc.is_active ? _pbc.target_omega : 0.0f, 2); Serial.print(',');
         Serial.print(_motor.getSpeed()); Serial.print(',');
@@ -367,6 +418,13 @@ private:
         char* valStr = strtok(nullptr, " ");
         if (!valStr) return;
         float val = atof(valStr);
+        
+        if (strcmp(action, "turn") == 0) {
+            char* pwmStr = strtok(nullptr, " ");
+            int pwm = pwmStr ? atoi(pwmStr) : 80;
+            turnTicks((long)val, pwm);
+            return;
+        }
 
         // ─── Зміна частоти КЕРУВАННЯ ───
         if (strcmp(action, "cfreq") == 0) {

@@ -5,6 +5,7 @@
 tf_env/
 venv/
 env/
+old/
 
 # Кеш-файли Python
 __pycache__/
