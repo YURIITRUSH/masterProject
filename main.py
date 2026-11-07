@@ -12,6 +12,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Tuple, List, Dict, Any, Optional
 
+import platform
+from fpdf import FPDF
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -202,10 +204,10 @@ class SerialManager:
 class DataCollector:
     """Етап 1: Збір телеметрії з реального заліза."""
     @staticmethod
-    def run(scenario_file: Optional[str] = None, port: Optional[str] = None, auto_plot: bool = False):
+    def run(scenario_file: Optional[str] = None, port: Optional[str] = None, auto_plot: bool = False, tag: str = "base"):
         Config.ensure_dirs()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = Config.LOGS_DIR / f"telemetry_{timestamp}.csv"
+        csv_path = Config.LOGS_DIR / f"{tag}_telemetry_{timestamp}.csv"
         
         try:
             with SerialManager(port) as hw, open(csv_path, "w", newline='', encoding="utf-8") as f:
@@ -342,12 +344,12 @@ class AITrainer:
         plt.xlabel('Епоха'); plt.ylabel('Помилка (MSE)')
         plt.legend(); plt.grid(True)
         plt.savefig(Config.LOGS_DIR / "training_history.png", dpi=150)
+        plt.close()
         print(f"✅ Модель збережена! Графік навчання: {Config.LOGS_DIR / 'training_history.png'}")
 
 class HILController:
-    """Етап 4: HIL-тест (нейромережа керує реальним мотором)."""
     @staticmethod
-    def run(target_speed: float, port: Optional[str] = None, auto_plot: bool = False):
+    def run(target_speed: float, port: Optional[str] = None, auto_plot: bool = False, static_mode: bool = False, tag: str = "ai"):
         import tensorflow as tf
         
         if not Config.MODEL_FILE.exists(): 
@@ -357,19 +359,24 @@ class HILController:
         with open(Config.SCALER_FILE, 'rb') as f: 
             scaler = pickle.load(f)
         
+        mode_name = "Hybrid (Static AI)" if static_mode else "Dynamic AI"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = Config.LOGS_DIR / f"ai_telemetry_{timestamp}.csv"
+        
+        # Використовуємо tag напряму, щоб уникнути дублювання префіксів
+        csv_path = Config.LOGS_DIR / f"{tag}_telemetry_{timestamp}.csv"
         
         try:
             with SerialManager(port) as hw, open(csv_path, "w", newline='', encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["Timestamp", "Current_A", "Voltage", "Omega", "Target", "PWM", "Kp", "Ki", "Kd"])
                 
-                print(f"🚀 HIL-тест: ШІ керує мотором. Ціль: {target_speed} рад/с")
+                print(f"🚀 HIL-тест ({mode_name}): Ціль: {target_speed} рад/с")
                 hw.send("cfreq 100")
                 hw.send(f"w {target_speed}")
                 
                 last_tune, kp, ki, kd = time.time(), 0.4, 0.1, 0.002
+                is_calibrated = False
+                
                 while True:
                     line = hw.ser.readline().decode('utf-8', errors='ignore').strip()
                     if line and ',' in line:
@@ -377,8 +384,10 @@ class HILController:
                         if len(parts) >= 7:
                             curr, volt, omega, target, pwm = map(float, parts[:5])
                             
-                            # Оновлення коефіцієнтів раз на 100 мс
-                            if time.time() - last_tune > 0.1 and target != 0:
+                            # Логіка оновлення (для static_mode оновлюємо лише 1 раз)
+                            need_update = (not static_mode and time.time() - last_tune > 0.1) or (static_mode and not is_calibrated)
+                            
+                            if need_update and target != 0:
                                 error = target - omega
                                 X = np.array([[target, error]])
                                 X_n = (X - scaler['X_mean']) / np.where(scaler['X_std'] == 0, 1, scaler['X_std'])
@@ -389,18 +398,19 @@ class HILController:
                                                      [Config.BOUNDS_KP[1], Config.BOUNDS_KI[1], Config.BOUNDS_KD[1]])
                                 
                                 hw.send(f"kp {kp:.3f}"); hw.send(f"ki {ki:.3f}"); hw.send(f"kd {kd:.5f}")
-                                print(f"Target: {target:4.1f} | Error: {error:5.2f} | Kp={kp:.3f}, Ki={ki:.3f}")
+                                print(f"[{mode_name}] Target: {target:4.1f} | Error: {error:5.2f} | Kp={kp:.3f}, Ki={ki:.3f}")
                                 last_tune = time.time()
+                                is_calibrated = True
                             
                             writer.writerow([datetime.now().isoformat(), curr, volt, omega, target, pwm, f"{kp:.4f}", f"{ki:.4f}", f"{kd:.5f}"])
                             f.flush()
                             
         except KeyboardInterrupt:
-            print("\n🛑 Зупинка HIL-тесту...")
+            print(f"\n🛑 Зупинка {mode_name}...")
         except Exception as e:
             print(f"\n❌ Помилка: {e}")
         finally:
-            print(f"💾 Лог HIL-тесту збережено у {csv_path}")
+            print(f"💾 Лог {mode_name} збережено у {csv_path}")
             if auto_plot: Analyzer.run(file_path=str(csv_path))
 
 class Analyzer:
@@ -419,7 +429,13 @@ class Analyzer:
         t = (pd.to_datetime(df['Timestamp']) - pd.to_datetime(df['Timestamp']).iloc[0]).dt.total_seconds().values
         
         plt.style.use('seaborn-v0_8-whitegrid')
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        
+        has_gains = 'Kp' in df.columns
+        
+        if has_gains:
+            fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+        else:
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
         
         # 1. Швидкість
         ax1.plot(t, df['Omega'], 'b-', linewidth=2, label='Фактична швидкість')
@@ -432,26 +448,32 @@ class Analyzer:
         ax2.set_ylabel('ШІМ', fontsize=11)
         ax2.legend(loc='lower right'); ax2.grid(True, linestyle=':')
         
-        # 3. Струм та Kp (якщо є)
+        # 3. Струм
         ax3.plot(t, df['Current_A'], 'm-', linewidth=1.5, label='Струм (А)')
         ax3.set_ylabel('Струм (А)', fontsize=11)
-        ax3.set_xlabel('Час (с)', fontsize=11)
         ax3.grid(True, linestyle=':')
-        
-        if 'Kp' in df.columns:
-            ax4 = ax3.twinx()
-            ax4.plot(t, df['Kp'], 'c--', alpha=0.6, label='Коефіцієнт Kp')
-            ax4.set_ylabel('Kp (від нейромережі)', fontsize=11, color='c')
-            ax4.tick_params(axis='y', labelcolor='c')
-            ax4.legend(loc='upper right')
-        else:
+        if not has_gains:
+            ax3.set_xlabel('Час (с)', fontsize=11)
             ax3.legend(loc='upper right')
+        
+        # 4. Коефіцієнти PID (тільки якщо є дані)
+        if has_gains:
+            ax4.plot(t, df['Kp'], 'c-', linewidth=2, label='Kp')
+            ax4.plot(t, df['Ki'], 'm-', linewidth=2, label='Ki')
+            # Множимо Kd на 100 для наочності, щоб він був на одному масштабі з іншими
+            ax4.plot(t, df['Kd'] * 100, 'y--', linewidth=2, label='Kd × 100') 
+            
+            ax4.set_ylabel('Коефіцієнти PID', fontsize=11)
+            ax4.set_xlabel('Час (с)', fontsize=11)
+            ax4.legend(loc='upper right')
+            ax4.grid(True, linestyle=':')
         
         plt.suptitle(f"Аналіз: {Path(file_path).name}", fontsize=14, fontweight='bold')
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
+        plt.close()
         print(f"✅ Графік успішно збережено: {save_path}")
-        
+    
     @staticmethod
     def compare(file1: str, file2: str, save_path: str = "logs/comparison.png"):
         """Накладання графіків двох файлів на одне полотно."""
@@ -489,7 +511,97 @@ class Analyzer:
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
+        plt.close()
         print(f"✅ Порівняльний графік збережено: {save_path}")
+
+class ReportGenerator:
+    @staticmethod
+    def create_multi_scenario_pdf(data_list: list, save_path: str = "logs/Final_Multi_Report.pdf"):
+        print(f"📄 Генерація багатосторінкового PDF-звіту...")
+        import matplotlib.pyplot as plt
+
+        pdf = FPDF()
+        font_path = "C:/Windows/Fonts/arial.ttf" if platform.system() == "Windows" else "DejaVuSans.ttf"
+        
+        # Титульна сторінка
+        pdf.add_page()
+        try:
+            pdf.add_font("Arial", "", font_path, uni=True)
+            pdf.set_font("Arial", size=20)
+        except:
+            pdf.set_font("Helvetica", size=20)
+            
+        pdf.ln(60)
+        pdf.cell(200, 20, txt="ЗВІТ ПРО РЕЗУЛЬТАТИ HIL-ДОСЛІДЖЕННЯ", ln=True, align='C')
+        pdf.set_font("Arial", size=14)
+        pdf.cell(200, 10, txt="Порівняння Baseline, Hybrid та Dynamic AI", ln=True, align='C')
+        pdf.cell(200, 10, txt=f"Дата: {datetime.now().strftime('%Y-%m-%d')}", ln=True, align='C')
+
+        for idx, data in enumerate(data_list):
+            pdf.add_page()
+            pdf.set_font("Arial", size=14)
+            pdf.cell(200, 10, txt=f"Сценарій {idx+1}: {data['name']}", ln=True)
+            pdf.ln(5)
+
+            df_b = pd.read_csv(data['baseline'])
+            df_h = pd.read_csv(data['hybrid'])
+            df_a = pd.read_csv(data['ai'])
+
+            def calc_metrics(df):
+                target = df['Target'].max() 
+                if target == 0: target = 15.0
+                error = target - df['Omega'].values
+                iae = np.trapz(np.abs(error), dx=0.01)
+                peak = df['Omega'].max()
+                overshoot = max(0, (peak - target) / target * 100)
+                return iae, overshoot
+
+            iae_b, os_b = calc_metrics(df_b)
+            iae_h, os_h = calc_metrics(df_h)
+            iae_a, os_a = calc_metrics(df_a)
+
+            pdf.set_font("Arial", size=10)
+            pdf.cell(50, 10, txt="Метрика", border=1, align='C')
+            pdf.cell(45, 10, txt="Baseline (PID)", border=1, align='C')
+            pdf.cell(45, 10, txt="Hybrid (Static AI)", border=1, align='C')
+            pdf.cell(45, 10, txt="Dynamic AI", border=1, align='C')
+            pdf.ln()
+            
+            pdf.cell(50, 10, txt="IAE (Інтеграл похибки)", border=1)
+            pdf.cell(45, 10, txt=f"{iae_b:.2f}", border=1, align='C')
+            pdf.cell(45, 10, txt=f"{iae_h:.2f}", border=1, align='C')
+            pdf.cell(45, 10, txt=f"{iae_a:.2f}", border=1, align='C')
+            pdf.ln()
+            
+            pdf.cell(50, 10, txt="Макс. перерегулювання", border=1)
+            pdf.cell(45, 10, txt=f"{os_b:.1f}%", border=1, align='C')
+            pdf.cell(45, 10, txt=f"{os_h:.1f}%", border=1, align='C')
+            pdf.cell(45, 10, txt=f"{os_a:.1f}%", border=1, align='C')
+            pdf.ln(15)
+
+            t_b = (pd.to_datetime(df_b['Timestamp']) - pd.to_datetime(df_b['Timestamp']).iloc[0]).dt.total_seconds().values
+            t_h = (pd.to_datetime(df_h['Timestamp']) - pd.to_datetime(df_h['Timestamp']).iloc[0]).dt.total_seconds().values
+            t_a = (pd.to_datetime(df_a['Timestamp']) - pd.to_datetime(df_a['Timestamp']).iloc[0]).dt.total_seconds().values
+
+            plt.figure(figsize=(10, 4))
+            plt.plot(t_b, df_b['Omega'], 'b-', alpha=0.5, label='Baseline (PID)')
+            plt.plot(t_h, df_h['Omega'], 'orange', linewidth=1.5, label='Hybrid (Static AI)')
+            plt.plot(t_a, df_a['Omega'], 'r-', linewidth=2, label='Dynamic AI')
+            plt.plot(t_b, df_b['Target'], 'k--', alpha=0.5, label='Target')
+            plt.title(f'Динаміка: {data["name"]}')
+            plt.ylabel('Швидкість (рад/с)'); plt.xlabel('Час (с)')
+            plt.legend(); plt.grid(True)
+            plt.tight_layout()
+            
+            chart_path = f"logs/temp_chart_{idx}.png"
+            plt.savefig(chart_path, dpi=150)
+            plt.close()
+            
+            pdf.image(chart_path, x=15, w=180)
+
+        pdf.output(save_path)
+        print(f"✅ Багатосторінковий звіт збережено: {save_path}")
+
 # ============================================================================
 # 4. ГОЛОВНИЙ КОНТРОЛЕР (CLI - Інтерфейс командного рядка)
 # ============================================================================
@@ -505,6 +617,7 @@ if __name__ == "__main__":
     p_col.add_argument("--port", default=None, help="COM-порт (наприклад, COM5)")
     p_col.add_argument("--scenario", default=None, help="Шлях до файлу сценарію (.txt)")
     p_col.add_argument("--plot", action="store_true", help="Автоматично побудувати графік після завершення")
+    p_col.add_argument("--tag", default="base", help="Тег для назви файлу (наприклад, scenario1)")
 
     # Команда calibrate
     subs.add_parser("calibrate", help="Калібрування Digital Twin за останнім логом")
@@ -518,7 +631,9 @@ if __name__ == "__main__":
     p_ai.add_argument("--port", default=None, help="COM-порт")
     p_ai.add_argument("--target", type=float, default=8.0, help="Цільова швидкість (рад/с)")
     p_ai.add_argument("--plot", action="store_true", help="Автоматично побудувати графік після завершення")
-
+    p_ai.add_argument("--tag", default="ai", help="Тег для назви файлу")
+    p_ai.add_argument("--static", action="store_true", help="Використовувати статичні (гібридні) коефіцієнти")
+    
     # Команда analyze
     p_ana = subs.add_parser("analyze", help="Побудова графіків за існуючим логом")
     p_ana.add_argument("--file", default=None, help="Шлях до CSV-файлу")
@@ -529,19 +644,51 @@ if __name__ == "__main__":
     p_cmp.add_argument("--file1", required=True, help="Шлях до CSV 1")
     p_cmp.add_argument("--file2", required=True, help="Шлях до CSV 2")
     p_cmp.add_argument("--save", default="logs/comparison.png", help="Шлях для збереження")
+
+    # Команда final-report
+    subs.add_parser("final-report", help="Генерація повного PDF звіту для всіх сценаріїв")
     
     args = parser.parse_args()
 
     # Маршрутизація команд
     if args.cmd == "collect": 
-        DataCollector.run(args.scenario, args.port, args.plot)
+        DataCollector.run(args.scenario, args.port, args.plot, args.tag)
     elif args.cmd == "calibrate": 
         Calibrator.run()
     elif args.cmd == "train": 
         AITrainer.run(args.max_target)
     elif args.cmd == "ai": 
-        HILController.run(args.target, args.port, args.plot)
+        HILController.run(args.target, args.port, args.plot, args.static, args.tag)
     elif args.cmd == "analyze":
         Analyzer.run(args.file, args.save)
     elif args.cmd == "compare":
         Analyzer.compare(args.file1, args.file2, args.save)
+    elif args.cmd == "final-report":
+        import glob
+        # Знаходимо найсвіжіші файли для кожного типу
+        def get_latest(prefix):
+            files = glob.glob(str(Config.LOGS_DIR / f"{prefix}_*.csv"))
+            return max(files, key=os.path.getctime) if files else None
+
+        data_list = [
+            {
+                "name": "Еталонний запуск (scenario.txt)",
+                "baseline": get_latest("base_scenario_telemetry"),
+                "hybrid": get_latest("hybrid_scenario_telemetry"),
+                "ai": get_latest("ai_scenario_telemetry")
+            },
+            {
+                "name": "Стрес-тест (scenario-stress.txt)",
+                "baseline": get_latest("base_scenario-stress_telemetry"),
+                "hybrid": get_latest("hybrid_scenario-stress_telemetry"),
+                "ai": get_latest("ai_scenario-stress_telemetry")
+            }
+        ]
+        
+        # Фільтруємо порожні, якщо якийсь тест не запускався
+        data_list = [d for d in data_list if d["baseline"] and d["hybrid"] and d["ai"]]
+        
+        if data_list:
+            ReportGenerator.create_multi_scenario_pdf(data_list, "logs/FINAL_THESIS_REPORT.pdf")
+        else:
+            print("❌ Не знайдено повних наборів даних (baseline, hybrid, ai). Перевірте логи.")

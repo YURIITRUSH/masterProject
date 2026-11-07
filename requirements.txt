@@ -4,3 +4,4 @@ scipy
 matplotlib
 numpy
 pyserial
+fpdf2
