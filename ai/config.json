@@ -1,16 +1,14 @@
 {
     "hardware": {
-        "port": "auto",
-        "baudrate": 115200,
         "supply_voltage": 10.39
     },
     "motor_parameters": {
-        "R": 18.847,
+        "R": 4.5,
         "L": 0.01,
-        "Ke": 0.19503,
-        "Km": 0.19503,
+        "Ke": 0.6,
+        "Km": 0.6,
         "J": 0.001,
         "b": 1e-06,
-        "Ts": 0.15
+        "Ts": 0.05
     }
 }
