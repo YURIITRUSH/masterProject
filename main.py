@@ -23,6 +23,7 @@ import serial.tools.list_ports
 from scipy.optimize import differential_evolution, nnls
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 # ============================================================================
 # 0. ЦЕНТРАЛІЗОВАНА КОНФІГУРАЦІЯ

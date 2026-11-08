@@ -1,12 +1,12 @@
 {
     "hardware": {
-        "supply_voltage": 10.39
+        "supply_voltage": 10.03
     },
     "motor_parameters": {
-        "R": 4.5,
+        "R": 13.349,
         "L": 0.01,
-        "Ke": 0.6,
-        "Km": 0.6,
+        "Ke": 0.26422,
+        "Km": 0.26422,
         "J": 0.001,
         "b": 1e-06,
         "Ts": 0.05
