@@ -54,6 +54,17 @@ class Config:
         cls.AI_DIR.mkdir(exist_ok=True)
         cls.LOGS_DIR.mkdir(exist_ok=True)
 
+    @classmethod
+    def get_calibrated_pbc_params(cls):
+        """Повертає R та Ke з config.json для синхронізації з прошивкою."""
+        try:
+            with open(cls.CONFIG_FILE, 'r') as f:
+                cfg = json.load(f)
+            m = cfg['motor_parameters']
+            return m.get('R', 4.5), m.get('Ke', 0.6)
+        except Exception:
+            return 4.5, 0.6
+
 # ============================================================================
 # 1. ЦИФРОВИЙ ДВІЙНИК (СИНХРОНІЗОВАНИЙ З ПРОШИВКОЮ)
 # ============================================================================
@@ -93,19 +104,28 @@ class DigitalTwin:
             d_filtered += (1.0 - np.exp(-dt / 0.02)) * (de_raw - d_filtered)
             
             i_ref = np.clip(e_sum + kp * e + kd * d_filtered, -2.0, 2.0)
-            u = self.Ke * target + self.R * i_ref # Спрощений PBC для оптимізатора
-            
-            # Feedforward тертя
-            if target > 0.1 and u > 0: u += 0.3 + 0.02 * abs(target)
-            elif target < -0.1 and u < 0: u -= 0.3 + 0.02 * abs(target)
-            
-            target_pwm = np.clip(abs(u) / self.V_supply, 0.0, 1.0) * 255.0
+            u_raw = self.Ke * target + self.R * i_ref
+            if target > 0.1 and u_raw > 0: u_raw += 0.3 + 0.02 * abs(target)
+            elif target < -0.1 and u_raw < 0: u_raw -= 0.3 + 0.02 * abs(target)
+
+            # Обмеження напруги
+            u_raw = np.clip(u_raw, -self.V_supply, self.V_supply)
+
+            # Перетворення в PWM з насиченням
+            target_pwm = np.clip(abs(u_raw) / self.V_supply, 0.0, 1.0) * 255.0
+
             # Slew Rate
+            signed_target_pwm = np.sign(u_raw) * target_pwm
             max_delta = 1000.0 * dt
-            if target_pwm > current_pwm + max_delta: current_pwm += max_delta
-            elif target_pwm < current_pwm - max_delta: current_pwm -= max_delta
-            else: current_pwm = target_pwm
-            
+            if signed_target_pwm > current_pwm + max_delta:
+                current_pwm += max_delta
+            elif signed_target_pwm < current_pwm - max_delta:
+                current_pwm -= max_delta
+            else:
+                current_pwm = signed_target_pwm
+
+            u = (current_pwm / 255.0) * self.V_supply
+                        
             # Інтеграція з підкроками
             n_sub = max(1, int(np.ceil(dt / max_internal_dt)))
             sub_dt = dt / n_sub
@@ -217,6 +237,11 @@ class DataCollector:
                 hw.send("kp 0.400")
                 hw.send("ki 0.100")
                 hw.send("kd 0.002")
+                # Синхронізація PBC-параметрів з калібруванням
+                R_cal, Ke_cal = Config.get_calibrated_pbc_params()
+                hw.send(f"r {R_cal:.4f}")
+                hw.send(f"ke {Ke_cal:.5f}")
+                print(f"⚙️ PBC синхронізовано: R={R_cal:.3f} Ом, ke={Ke_cal:.4f}")
                 time.sleep(0.1) # Даємо Arduino час застосувати
 
                 if scenario_file:
@@ -283,7 +308,11 @@ class AITrainer:
     def run(max_target: float = 15.0): # Дефолт 15.0, бо 21 недосяжне
         import tensorflow as tf
         from tensorflow.keras import layers, models
-        from sklearn.model_selection import train_test_split
+
+        np.random.seed(42)
+        import random as _random
+        _random.seed(42)
+        tf.random.set_seed(42)
         
         print(f"🧠 Генерація даних (від 3.0 до {max_target} рад/с) та навчання ШІ...")
         twin = DigitalTwin()
@@ -295,8 +324,14 @@ class AITrainer:
         for i, target in enumerate(targets):
             print(f"  Оптимізація для {target:.1f} рад/с ({i+1}/{len(targets)})")
             def obj(g): 
-                iae, over = twin.simulate_closed_loop(target, *g, x0=0.0)
-                return iae + ((over - 15.0) * Config.PENALTY_OVERSHOOT if over > 15.0 else 0.0)
+                # Усереднюємо IAE за трьома стартовими станами
+                total = 0.0
+                for frac in (0.0, 0.25, 0.5):
+                    x0 = target * frac
+                    iae, over = twin.simulate_closed_loop(target, *g, x0=x0)
+                    penalty = (over - 15.0) * Config.PENALTY_OVERSHOOT if over > 15.0 else 0.0
+                    total += iae + penalty
+                return total / 3.0
             
             # Фіксуємо seed для відтворюваності
             res = differential_evolution(obj, bounds, maxiter=10, popsize=8, seed=42+i)
@@ -307,14 +342,35 @@ class AITrainer:
                 err = target - x0
                 X.append([target, err])
                 Y.append(res.x)
-                
-        X, Y = np.array(X), np.array(Y)
-        X_m, X_s, Y_m, Y_s = X.mean(0), X.std(0), Y.mean(0), Y.std(0)
-        X_n = (X - X_m) / np.where(X_s == 0, 1, X_s)
-        Y_n = (Y - Y_m) / np.where(Y_s == 0, 1, Y_s)
         
-        # Валідаційна вибірка
-        X_train, X_val, Y_train, Y_val = train_test_split(X_n, Y_n, test_size=0.2, random_state=42)
+        # FIX: спочатку поділ за цілями, потім нормалізація на train
+        X_arr = np.array(X)  # [target, error]
+        Y_arr = np.array(Y)
+
+        # Унікальні цілі
+        unique_targets = np.unique(X_arr[:, 0])
+        rng = np.random.default_rng(42)
+        rng.shuffle(unique_targets)
+        n_val = max(1, int(len(unique_targets) * 0.2))
+        val_targets = unique_targets[-n_val:]
+
+        val_mask = np.isin(X_arr[:, 0], val_targets)
+        train_mask = ~val_mask
+
+        X_tr, X_va = X_arr[train_mask], X_arr[val_mask]
+        Y_tr, Y_va = Y_arr[train_mask], Y_arr[val_mask]
+
+        # Нормалізація ТІЛЬКИ на train
+        X_m, X_s = X_tr.mean(0), X_tr.std(0)
+        Y_m, Y_s = Y_tr.mean(0), Y_tr.std(0)
+
+        X_n = (X_arr - X_m) / np.where(X_s == 0, 1, X_s)
+        Y_n = (Y_arr - Y_m) / np.where(Y_s == 0, 1, Y_s)
+
+        X_train = (X_tr - X_m) / np.where(X_s == 0, 1, X_s)
+        Y_train = (Y_tr - Y_m) / np.where(Y_s == 0, 1, Y_s)
+        X_val = (X_va - X_m) / np.where(X_s == 0, 1, X_s)
+        Y_val = (Y_va - Y_m) / np.where(Y_s == 0, 1, Y_s)
         
         model = models.Sequential([
             layers.Input((2,)), layers.Dense(32, activation='relu'), 
@@ -361,6 +417,10 @@ class HILController:
                 writer.writerow(["Timestamp", "Current_A", "Voltage", "Omega", "Target", "PWM", "Kp", "Ki", "Kd"])
                 
                 print(f"🚀 HIL-тест ({mode_name}): Ціль: {target_speed} рад/с")
+                R_cal, Ke_cal = Config.get_calibrated_pbc_params()
+                hw.send(f"r {R_cal:.4f}")
+                hw.send(f"ke {Ke_cal:.5f}")
+                time.sleep(0.1)
                 hw.send("cfreq 100")
                 
                 def run_scenario():
@@ -531,31 +591,49 @@ class ReportGenerator:
         pdf.cell(200, 10, txt="Порівняння Baseline, Hybrid та Dynamic AI", ln=True, align='C')
 
         def crop_active_phase(df):
-            """Обрізає лог, залишаючи тільки час, коли мотор реально отримував команди (Target != 0)"""
-            # Знаходимо перший індекс, де цільова швидкість не 0
+            """Обрізає лог до активної фази та повертає (df, t)."""
             active_idx = df[df['Target'] != 0].index
-            if len(active_idx) == 0: return df # Якщо мотор не рухався
+            if len(active_idx) == 0:
+                # FIX: повертаємо кортеж, а не один df
+                t = (pd.to_datetime(df['Timestamp']) - pd.to_datetime(df['Timestamp']).iloc[0]).dt.total_seconds().values
+                return df.copy().reset_index(drop=True), t
             
             start_idx = active_idx[0]
-            end_idx = active_idx[-1]
+            end_idx = min(active_idx[-1] + 100, len(df) - 1)
             
-            # Додаємо 1 секунду (або ~100 семплів) після зупинки, щоб побачити гальмування
-            end_idx = min(end_idx + 100, len(df) - 1)
-            
-            # Скидаємо індекси та час, щоб графіки стартували з 0
             cropped = df.iloc[start_idx:end_idx].copy().reset_index(drop=True)
             t = (pd.to_datetime(cropped['Timestamp']) - pd.to_datetime(cropped['Timestamp']).iloc[0]).dt.total_seconds().values
             return cropped, t
-
+        
         def calc_metrics(df):
             cropped, t = crop_active_phase(df)
+            
+            # IAE та overshoot — як раніше
             error = cropped['Target'].values - cropped['Omega'].values
             iae = np.trapezoid(np.abs(error), x=t)
-            overshoot = max(0, (cropped['Omega'].max() - cropped['Target'].max()) / (cropped['Target'].max() + 1e-9) * 100)
+            target_max = cropped['Target'].max()
+            if abs(target_max) < 1e-9:
+                return 0.0, 0.0, 0.0
+            overshoot = max(0, (cropped['Omega'].max() - target_max) / abs(target_max) * 100)
             
-            # Статична похибка беремо останні 10% активного часу
-            tail = max(1, int(len(cropped) * 0.1))
-            steady_err = np.mean(np.abs(cropped['Target'].values[-tail:] - cropped['Omega'].values[-tail:]))
+            # FIX: статична похибка — на сталій ділянці ПЕРЕД останньою зміною цілі
+            target_arr = cropped['Target'].values
+            nonzero_mask = target_arr != 0
+            if nonzero_mask.sum() == 0:
+                return iae, overshoot, 0.0
+            
+            last_nonzero = np.where(nonzero_mask)[0][-1]
+            # Беремо ділянку від 70% до 95% активної частини (пропускаємо хвіст при гальмуванні)
+            active_len = last_nonzero + 1
+            start_ss = int(active_len * 0.7)
+            end_ss = int(active_len * 0.95)
+            if end_ss <= start_ss:
+                start_ss, end_ss = 0, active_len
+            
+            steady_err = np.mean(np.abs(
+                cropped['Target'].values[start_ss:end_ss] - cropped['Omega'].values[start_ss:end_ss]
+            ))
+            
             return iae, overshoot, steady_err
 
         for idx, data in enumerate(data_list):
