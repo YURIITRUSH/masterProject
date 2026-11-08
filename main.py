@@ -37,7 +37,7 @@ class Config:
     SCALER_FILE = AI_DIR / "tf_scaler.pkl"
 
     BAUD_RATE = 115200
-    TELEMETRY_REGEX = re.compile(r'^-?\d+(\.\d+)?(,-?\d+(\.\d+)?){6}$') # Рівно 7 полів
+    TELEMETRY_REGEX = re.compile(r'^-?\d+(\.\d+)?(,-?\d+(\.\d+)?){3,}$')
 
     BOUNDS_KP = (0.1, 1.5)
     BOUNDS_KI = (0.01, 1.0)
@@ -199,11 +199,25 @@ class DataCollector:
                         
                         if Config.TELEMETRY_REGEX.match(line):
                             data = tuple(float(p) for p in line.split(','))
-                            writer.writerow([datetime.now().isoformat()] + list(data))
-                            f.flush()
-                        elif line: print(f"[Arduino]: {line}")
+                            try:
+                                writer.writerow([datetime.now().isoformat()] + list(data))
+                                f.flush()
+                            except ValueError:
+                                break
+                        elif line.startswith("[") or line.startswith("---") or line.startswith("DIAG"):
+                            # Виводимо тільки службові повідомлення, ігноруємо "сміття"
+                            print(f"[Arduino]: {line}")
 
                 threading.Thread(target=read_loop, daemon=True).start()
+                
+                # АВТОМАТИЧНЕ СКИДАННЯ КОЕФІЦІЄНТІВ ДО БАЗОВИХ (для чесного Baseline)
+                print("⚙️ Встановлюємо базові коефіцієнти PID (Kp=0.4, Ki=0.1, Kd=0.002)...")
+                # Очищаємо буфер від старого сміття
+                hw.ser.reset_input_buffer()
+                hw.send("kp 0.400")
+                hw.send("ki 0.100")
+                hw.send("kd 0.002")
+                time.sleep(0.1) # Даємо Arduino час застосувати
 
                 if scenario_file:
                     print(f"🚀 Виконання сценарію: {scenario_file}")
@@ -338,6 +352,9 @@ class HILController:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = Config.LOGS_DIR / f"{tag}_telemetry_{timestamp}.csv"
         
+        # Прапорець для автоматичного завершення
+        scenario_done = threading.Event()
+        
         try:
             with SerialManager(port) as hw, open(csv_path, "w", newline='', encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -346,48 +363,96 @@ class HILController:
                 print(f"🚀 HIL-тест ({mode_name}): Ціль: {target_speed} рад/с")
                 hw.send("cfreq 100")
                 
-                # Якщо є сценарій - запускаємо його, інакше просто 'w'
+                def run_scenario():
+                    if not os.path.exists(scenario_file):
+                        print(f"❌ Файл {scenario_file} не знайдено!")
+                        scenario_done.set()
+                        return
+                        
+                    with open(scenario_file, "r", encoding="utf-8") as f_scr:
+                        lines = [l.strip() for l in f_scr if l.strip() and not l.strip().startswith("#")]
+                        
+                    if not lines:
+                        print("⚠️ Сценарій порожній!")
+                        scenario_done.set()
+                        return
+                        
+                    print(f"📜 Виконуємо {len(lines)} команд...")
+                    for line in lines:
+                        if line.lower().startswith("wait"):
+                            try:
+                                delay = float(line.split()[1])
+                                print(f"⏳ Пауза {delay} сек...")
+                                time.sleep(delay)
+                            except Exception as e: 
+                                print(f"⚠️ Помилка паузи: {e}")
+                            continue
+                            
+                        if line.lower() == "stop_all": 
+                            print("🏁 Знайдено stop_all.")
+                            break
+                            
+                        print(f"➡️ Відправка: {line}")
+                        hw.send(line)
+                        time.sleep(0.05)
+                    
+                    time.sleep(2) # Даємо час на останні логи
+                    scenario_done.set() 
+                    print("\n🏁 Сценарій завершено. Зупинка HIL-тесту...")
+
                 if scenario_file:
-                    threading.Thread(target=lambda: [hw.send(l.strip()) or time.sleep(0.05) for l in open(scenario_file) if l.strip() and not l.startswith("#")], daemon=True).start()
+                    threading.Thread(target=run_scenario, daemon=True).start()
                 else:
                     hw.send(f"w {target_speed}")
                 
                 last_tune, kp, ki, kd = time.time(), 0.4, 0.1, 0.002
                 is_calibrated = False
                 
-                while True:
+                while not scenario_done.is_set():
                     line = hw.ser.readline().decode('utf-8', errors='ignore').strip()
                     if line and ',' in line:
                         parts = line.split(',')
-                        if len(parts) == 7: # Суворо 7 полів
+                        if len(parts) == 7:
                             curr, volt, omega, target, pwm = map(float, parts[:5])
                             
                             need_update = (not static_mode and time.time() - last_tune > 0.1) or (static_mode and not is_calibrated)
                             
                             if need_update and target != 0:
-                                error = target - omega
-                                X = np.array([[target, error]])
-                                X_n = (X - scaler['X_mean']) / np.where(scaler['X_std'] == 0, 1, scaler['X_std'])
-                                Y = model.predict(X_n, verbose=0) * scaler['Y_std'] + scaler['Y_mean']
-                                
-                                kp, ki, kd = np.clip(Y[0], [Config.BOUNDS_KP[0], Config.BOUNDS_KI[0], Config.BOUNDS_KD[0]], [Config.BOUNDS_KP[1], Config.BOUNDS_KI[1], Config.BOUNDS_KD[1]])
-                                
-                                hw.send(f"kp {kp:.3f}"); hw.send(f"ki {ki:.3f}"); hw.send(f"kd {kd:.5f}")
-                                print(f"[{mode_name}] Target: {target:4.1f} | Error: {error:5.2f} | Kp={kp:.3f}, Ki={ki:.3f}")
-                                last_tune = time.time()
-                                is_calibrated = True
+                                try:
+                                    error = target - omega
+                                    # ЗАХИСТ: Нейромережа не знає від'ємних швидкостей, передаємо модулі
+                                    nn_target = np.clip(abs(target), 3.0, 18.0)
+                                    nn_error = np.clip(abs(error), -6.0, 6.0)
+                                    
+                                    X = np.array([[nn_target, nn_error]])
+                                    X_n = (X - scaler['X_mean']) / np.where(scaler['X_std'] == 0, 1, scaler['X_std'])
+                                    Y = model.predict(X_n, verbose=0) * scaler['Y_std'] + scaler['Y_mean']
+                                    
+                                    kp, ki, kd = np.clip(Y[0], [Config.BOUNDS_KP[0], Config.BOUNDS_KI[0], Config.BOUNDS_KD[0]], [Config.BOUNDS_KP[1], Config.BOUNDS_KI[1], Config.BOUNDS_KD[1]])
+                                    
+                                    if np.isnan(kp): raise ValueError("AI returned NaN")
+                                        
+                                    hw.send(f"kp {kp:.3f}"); hw.send(f"ki {ki:.3f}"); hw.send(f"kd {kd:.5f}")
+                                    print(f"[{mode_name}] Target: {target:4.1f} | Error: {error:5.2f} | Kp={kp:.3f}, Ki={ki:.3f}")
+                                    last_tune = time.time()
+                                    is_calibrated = True
+                                except Exception as ai_error:
+                                    print(f"⚠️ AI Error: {ai_error}")
                             
-                            writer.writerow([datetime.now().isoformat(), curr, volt, omega, target, pwm, f"{kp:.4f}", f"{ki:.4f}", f"{kd:.5f}"])
-                            f.flush()
+                            try:
+                                writer.writerow([datetime.now().isoformat(), curr, volt, omega, target, pwm, f"{kp:.4f}", f"{ki:.4f}", f"{kd:.5f}"])
+                                f.flush()
+                            except ValueError:
+                                break
                             
         except KeyboardInterrupt:
-            print(f"\n🛑 Зупинка...")
+            print(f"\n🛑 Ручна зупинка {mode_name}...")
         except Exception as e:
             print(f"\n❌ Помилка: {e}")
         finally:
-            print(f"💾 Лог збережено у {csv_path}")
+            print(f"💾 Лог {mode_name} збережено у {csv_path}")
             if auto_plot: Analyzer.run(file_path=str(csv_path))
-
+            
 # ============================================================================
 # 4. АНАЛІЗ ТА ЗВІТ
 # ============================================================================
@@ -448,7 +513,7 @@ class ReportGenerator:
     @staticmethod
     def create_multi_scenario_pdf(data_list: list, save_path: str = "logs/Final_Multi_Report.pdf"):
         import platform
-        from fpdf import FPDF # Імпорт всередині, щоб не ламало collect
+        from fpdf import FPDF 
         
         pdf = FPDF()
         font_path = "C:/Windows/Fonts/arial.ttf" if platform.system() == "Windows" else "DejaVuSans.ttf"
@@ -458,7 +523,6 @@ class ReportGenerator:
             pdf.add_font("Arial", "", font_path, uni=True)
             pdf.set_font("Arial", size=20)
         except:
-            print("⚠️ Шрифт не знайдено, використовуємо стандартний.")
             pdf.set_font("Helvetica", size=20)
             
         pdf.ln(60)
@@ -466,15 +530,32 @@ class ReportGenerator:
         pdf.set_font("Arial", size=14)
         pdf.cell(200, 10, txt="Порівняння Baseline, Hybrid та Dynamic AI", ln=True, align='C')
 
+        def crop_active_phase(df):
+            """Обрізає лог, залишаючи тільки час, коли мотор реально отримував команди (Target != 0)"""
+            # Знаходимо перший індекс, де цільова швидкість не 0
+            active_idx = df[df['Target'] != 0].index
+            if len(active_idx) == 0: return df # Якщо мотор не рухався
+            
+            start_idx = active_idx[0]
+            end_idx = active_idx[-1]
+            
+            # Додаємо 1 секунду (або ~100 семплів) після зупинки, щоб побачити гальмування
+            end_idx = min(end_idx + 100, len(df) - 1)
+            
+            # Скидаємо індекси та час, щоб графіки стартували з 0
+            cropped = df.iloc[start_idx:end_idx].copy().reset_index(drop=True)
+            t = (pd.to_datetime(cropped['Timestamp']) - pd.to_datetime(cropped['Timestamp']).iloc[0]).dt.total_seconds().values
+            return cropped, t
+
         def calc_metrics(df):
-            t = (pd.to_datetime(df['Timestamp']) - pd.to_datetime(df['Timestamp']).iloc[0]).dt.total_seconds().values
-            error = df['Target'].values - df['Omega'].values
-            iae = np.trapezoid(np.abs(error), x=t) # Сучасна функція
-            # Максимальне перерегулювання
-            overshoot = max(0, (df['Omega'].max() - df['Target'].max()) / (df['Target'].max() + 1e-9) * 100)
-            # Статична похибка (останні 10% часу)
-            tail = int(len(df) * 0.1)
-            steady_err = np.mean(np.abs(df['Target'].values[-tail:] - df['Omega'].values[-tail:]))
+            cropped, t = crop_active_phase(df)
+            error = cropped['Target'].values - cropped['Omega'].values
+            iae = np.trapezoid(np.abs(error), x=t)
+            overshoot = max(0, (cropped['Omega'].max() - cropped['Target'].max()) / (cropped['Target'].max() + 1e-9) * 100)
+            
+            # Статична похибка беремо останні 10% активного часу
+            tail = max(1, int(len(cropped) * 0.1))
+            steady_err = np.mean(np.abs(cropped['Target'].values[-tail:] - cropped['Omega'].values[-tail:]))
             return iae, overshoot, steady_err
 
         for idx, data in enumerate(data_list):
@@ -484,6 +565,7 @@ class ReportGenerator:
             pdf.ln(5)
 
             df_b, df_h, df_a = pd.read_csv(data['baseline']), pd.read_csv(data['hybrid']), pd.read_csv(data['ai'])
+            
             iae_b, os_b, ss_b = calc_metrics(df_b)
             iae_h, os_h, ss_h = calc_metrics(df_h)
             iae_a, os_a, ss_a = calc_metrics(df_a)
@@ -513,24 +595,28 @@ class ReportGenerator:
             pdf.cell(45, 10, txt=f"{ss_a:.2f}", border=1, align='C')
             pdf.ln(15)
 
-            # Тимчасовий графік у LOGS_DIR
-            t_b = (pd.to_datetime(df_b['Timestamp']) - pd.to_datetime(df_b['Timestamp']).iloc[0]).dt.total_seconds().values
-            t_h = (pd.to_datetime(df_h['Timestamp']) - pd.to_datetime(df_h['Timestamp']).iloc[0]).dt.total_seconds().values
-            t_a = (pd.to_datetime(df_a['Timestamp']) - pd.to_datetime(df_a['Timestamp']).iloc[0]).dt.total_seconds().values
+            # Малюємо ОБРІЗАНІ графіки
+            _, t_b = crop_active_phase(df_b)
+            _, t_h = crop_active_phase(df_h)
+            _, t_a = crop_active_phase(df_a)
+            
+            df_b_crop, _ = crop_active_phase(df_b)
+            df_h_crop, _ = crop_active_phase(df_h)
+            df_a_crop, _ = crop_active_phase(df_a)
 
             plt.figure(figsize=(10, 4))
-            plt.plot(t_b, df_b['Omega'], 'b-', alpha=0.5, label='Baseline')
-            plt.plot(t_h, df_h['Omega'], 'orange', linewidth=1.5, label='Hybrid')
-            plt.plot(t_a, df_a['Omega'], 'r-', linewidth=2, label='Dynamic AI')
-            plt.plot(t_b, df_b['Target'], 'k--', alpha=0.5, label='Target')
-            plt.title(f'Динаміка: {data["name"]}'); plt.ylabel('Швидкість'); plt.legend(); plt.grid(True)
+            plt.plot(t_b, df_b_crop['Omega'], 'b-', alpha=0.5, label='Baseline')
+            plt.plot(t_h, df_h_crop['Omega'], 'orange', linewidth=1.5, label='Hybrid')
+            plt.plot(t_a, df_a_crop['Omega'], 'r-', linewidth=2, label='Dynamic AI')
+            plt.plot(t_b, df_b_crop['Target'], 'k--', alpha=0.5, label='Target')
+            plt.title(f'Динаміка: {data["name"]}'); plt.ylabel('Швидкість (рад/с)'); plt.legend(); plt.grid(True)
             plt.tight_layout()
             
             chart_path = Config.LOGS_DIR / f"temp_chart_{idx}.png"
             plt.savefig(chart_path, dpi=150); plt.close()
             
             pdf.image(str(chart_path), x=15, w=180)
-            os.remove(chart_path) # Видаляємо сміття
+            os.remove(chart_path)
 
         pdf.output(save_path)
         print(f"✅ Звіт збережено: {save_path}")
@@ -586,8 +672,24 @@ if __name__ == "__main__":
             return max(files, key=os.path.getctime) if files else None
 
         data_list = [
-            {"name": "Еталонний запуск", "baseline": get_latest("base_scenario"), "hybrid": get_latest("hybrid_scenario"), "ai": get_latest("ai_scenario")},
-            {"name": "Стрес-тест", "baseline": get_latest("base_scenario-stress"), "hybrid": get_latest("hybrid_scenario-stress"), "ai": get_latest("ai_scenario-stress")}
+            {
+                "name": "Еталонний запуск", 
+                "baseline": get_latest("base_scenario"), 
+                "hybrid": get_latest("hybrid_scenario"), 
+                "ai": get_latest("ai_scenario")
+            },
+            {
+                "name": "Стрес-тест (реверс та гальмування)", 
+                "baseline": get_latest("base_stress"), 
+                "hybrid": get_latest("hybrid_stress"), 
+                "ai": get_latest("ai_stress")
+            },
+            {
+                "name": "Тест частоти (10/100/500 Гц)", 
+                "baseline": get_latest("base_freq"), 
+                "hybrid": get_latest("hybrid_freq"), 
+                "ai": get_latest("ai_freq")
+            }
         ]
         data_list = [d for d in data_list if all(d.values())]
         if data_list: ReportGenerator.create_multi_scenario_pdf(data_list, "logs/FINAL_THESIS_REPORT.pdf")
