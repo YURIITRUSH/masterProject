@@ -37,33 +37,37 @@ class Config:
     SCALER_FILE = AI_DIR / "tf_scaler.pkl"
 
     BAUD_RATE = 115200
-    TELEMETRY_REGEX = re.compile(r'^-?\d+(\.\d+)?(,-?\d+(\.\d+)?){3,}$')
+    # Рівно 7 полів: Current_A, Voltage, Omega, Target, PWM, Ticks, dTicks.
+    TELEMETRY_REGEX = re.compile(
+        r'^-?\d+(?:\.\d+)?(?:,-?\d+(?:\.\d+)?){6}$'
+    )
 
     BOUNDS_KP = (0.1, 1.5)
     BOUNDS_KI = (0.01, 1.0)
     BOUNDS_KD = (0.0001, 0.02)
     PENALTY_OVERSHOOT = 500.0
+    MAX_TARGET_ABS = 21.0
+    PWM_DEADZONE = 12.0
 
     DEFAULT_MOTOR_PARAMS = {
-        "R": 4.5, "L": 0.01, "Ke": 0.6, "Km": 0.6, 
-        "J": 0.001, "b": 1e-06, "Ts": 0.05 # Зменшено Ts, щоб двійник рушав
+        "R": 4.5, "L": 0.01, "Ke": 0.6, "Km": 0.6,
+        "J": 0.001, "b": 1e-06, "Ts": 0.05, "Rd": 0.05
     }
 
     @classmethod
     def ensure_dirs(cls):
-        cls.AI_DIR.mkdir(exist_ok=True)
-        cls.LOGS_DIR.mkdir(exist_ok=True)
+        cls.AI_DIR.mkdir(parents=True, exist_ok=True)
+        cls.LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def get_calibrated_pbc_params(cls):
-        """Повертає R та Ke з config.json для синхронізації з прошивкою."""
         try:
             with open(cls.CONFIG_FILE, 'r') as f:
                 cfg = json.load(f)
             m = cfg['motor_parameters']
-            return m.get('R', 4.5), m.get('Ke', 0.6)
+            return m.get('R', 4.5), m.get('Ke', 0.6), m.get('Rd', 0.05)
         except Exception:
-            return 4.5, 0.6
+            return 4.5, 0.6, 0.05
 
 # ============================================================================
 # 1. ЦИФРОВИЙ ДВІЙНИК (СИНХРОНІЗОВАНИЙ З ПРОШИВКОЮ)
@@ -73,22 +77,34 @@ class DigitalTwin:
         self.config = self._load_config(config_path)
         m = self.config['motor_parameters']
         self.R, self.L, self.Ke = m.get('R', 4.5), m.get('L', 0.01), m.get('Ke', 0.6)
-        self.Km, self.J, self.b, self.Ts = m.get('Km', 0.6), m.get('J', 0.001), m.get('b', 1e-6), m.get('Ts', 0.05)
-        self.V_supply = self.config['hardware'].get('supply_voltage', 12.0)
+        self.Km, self.J, self.b, self.Ts = (
+            m.get('Km', 0.6), m.get('J', 0.001),
+            m.get('b', 1e-6), m.get('Ts', 0.05)
+        )
+        self.Rd = m.get('Rd', 0.05)
+        self.V_supply = float(self.config.get('hardware', {}).get('supply_voltage', 12.0))
+        self.PWM_DEADZONE = Config.PWM_DEADZONE
 
     def _load_config(self, path: Path) -> Dict:
         if not path.exists():
-            return {"hardware": {"supply_voltage": 12.0}, "motor_parameters": Config.DEFAULT_MOTOR_PARAMS}
+            return {"hardware": {"supply_voltage": 12.0},
+                    "motor_parameters": Config.DEFAULT_MOTOR_PARAMS.copy()}
         with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+        data.setdefault("hardware", {})
+        data.setdefault("motor_parameters", {})
+        merged = Config.DEFAULT_MOTOR_PARAMS.copy()
+        merged.update(data["motor_parameters"])
+        data["motor_parameters"] = merged
+        return data
 
     def simulate_closed_loop(self, target: float, kp: float, ki: float, kd: float, x0: float = 0.0, dt: float = 0.01, T: float = 4.0) -> Tuple[float, float]:
         steps = int(T / dt)
         i, w = 0.0, x0
         e_sum, prev_e, d_filtered = 0.0, target - w, 0.0
-        iae, max_w = 0.0, w
+        iae, peak_progress = 0.0, (1.0 if target >= 0 else -1.0) * w
         current_pwm = 0.0
-        max_internal_dt = 0.0005 # Підкроки 0.5 мс для стійкості
+        max_internal_dt = 0.001
         
         for _ in range(steps):
             e = target - w
@@ -96,7 +112,7 @@ class DigitalTwin:
             if abs(e) < 6.0:
                 e_sum = np.clip(e_sum + ki * e * dt, -2.0, 2.0)
             else:
-                e_sum *= np.exp(-dt / 0.3)
+                e_sum *= np.exp(-dt / 0.2)
             
             # D-фільтр
             de_raw = (e - prev_e) / dt
@@ -104,7 +120,9 @@ class DigitalTwin:
             d_filtered += (1.0 - np.exp(-dt / 0.02)) * (de_raw - d_filtered)
             
             i_ref = np.clip(e_sum + kp * e + kd * d_filtered, -2.0, 2.0)
-            u_raw = self.Ke * target + self.R * i_ref
+            # Та сама формула PBC, що й у прошивці Arduino:
+            # u = ke*omega* + R*i_ref - Rd*(i - i_ref).
+            u_raw = self.Ke * target + self.R * i_ref - self.Rd * (i - i_ref)
             if target > 0.1 and u_raw > 0: u_raw += 0.3 + 0.02 * abs(target)
             elif target < -0.1 and u_raw < 0: u_raw -= 0.3 + 0.02 * abs(target)
 
@@ -124,7 +142,14 @@ class DigitalTwin:
             else:
                 current_pwm = signed_target_pwm
 
-            u = (current_pwm / 255.0) * self.V_supply
+            # Deadzone: |PWM| <= 12 -> 0 В, інакше ефективна частина зі знаком
+            pwm_mag = abs(current_pwm)
+            if pwm_mag <= self.PWM_DEADZONE:
+                u = 0.0
+            else:
+                sign_pwm = 1.0 if current_pwm > 0 else -1.0
+                effective_pwm = sign_pwm * (pwm_mag - self.PWM_DEADZONE)
+                u = (effective_pwm / 255.0) * self.V_supply
                         
             # Інтеграція з підкроками
             n_sub = max(1, int(np.ceil(dt / max_internal_dt)))
@@ -134,7 +159,8 @@ class DigitalTwin:
                 i_next = ((u - self.Ke * w) / max(self.R, 1e-9)) + (i - ((u - self.Ke * w) / max(self.R, 1e-9))) * np.exp(-sub_dt / tau_e)
                 torque = self.Km * i_next
                 
-                if abs(w) < 0.5 and abs(torque) < self.Ts:
+                # Поріг stick-slip відповідає документації: |omega| < 0.1 рад/с.
+                if abs(w) < 0.1 and abs(torque) < self.Ts:
                     dw = 0.0
                 else:
                     friction = self.Ts * np.sign(torque if abs(w) < 1e-4 else w)
@@ -145,10 +171,11 @@ class DigitalTwin:
                 if np.isnan(w) or abs(w) > 200: w = 0.0
                 if np.isnan(i) or abs(i) > 10: i = 0.0
 
-            max_w = max(max_w, w)
+            peak_progress = max(peak_progress, (1.0 if target >= 0 else -1.0) * w)
             iae += abs(e) * dt
             
-        overshoot = ((max_w - target) / target) * 100.0 if target > 0 else 0.0
+        # Симетрична оцінка для прямого та зворотного напрямків.
+        overshoot = ((peak_progress - abs(target)) / abs(target)) * 100.0 if abs(target) > 1e-9 else 0.0
         return iae, max(overshoot, 0.0)
 
 # ============================================================================
@@ -238,10 +265,11 @@ class DataCollector:
                 hw.send("ki 0.100")
                 hw.send("kd 0.002")
                 # Синхронізація PBC-параметрів з калібруванням
-                R_cal, Ke_cal = Config.get_calibrated_pbc_params()
+                R_cal, Ke_cal, Rd_cal = Config.get_calibrated_pbc_params()
                 hw.send(f"r {R_cal:.4f}")
                 hw.send(f"ke {Ke_cal:.5f}")
-                print(f"⚙️ PBC синхронізовано: R={R_cal:.3f} Ом, ke={Ke_cal:.4f}")
+                hw.send(f"rd {Rd_cal:.4f}")
+                print(f"⚙️ PBC синхронізовано: R={R_cal:.3f} Ом, "f"ke={Ke_cal:.4f}, rd={Rd_cal:.4f}")
                 time.sleep(0.1) # Даємо Arduino час застосувати
 
                 if scenario_file:
@@ -253,6 +281,13 @@ class DataCollector:
                             if line.lower().startswith("wait "):
                                 time.sleep(float(line.split(" ")[1])); continue
                             if line.lower() == "stop_all": break
+                            if line.lower().startswith("w "):
+                                try:
+                                    tgt = float(line.split()[1])
+                                    tgt = float(np.clip(tgt, -Config.MAX_TARGET_ABS, Config.MAX_TARGET_ABS))
+                                    line = f"w {tgt:.3f}"
+                                except Exception:
+                                    continue
                             hw.send(line); time.sleep(0.05)
                 else:
                     print("💡 Ручний режим (Ctrl+C для виходу).")
@@ -268,44 +303,209 @@ class DataCollector:
 class Calibrator:
     @staticmethod
     def run():
-        # Шукаємо базові логи, виключаючи ті, що згенеровані ШІ
+        Config.ensure_dirs()
         all_logs = glob.glob(str(Config.LOGS_DIR / "*telemetry_*.csv"))
-        csv_files = [f for f in all_logs if "ai_" not in Path(f).name and "hybrid_" not in Path(f).name]
-        
-        if not csv_files: 
-            print("❌ Немає базових логів для калібрування."); return
+        csv_files = [f for f in all_logs
+                     if "ai_" not in Path(f).name and "hybrid_" not in Path(f).name]
+
+        if not csv_files:
+            print("❌ Немає базових логів для калібрування.")
+            return
         latest = max(csv_files, key=os.path.getctime)
-        
+
         print(f"📋 Калібрування за файлом: {latest}...")
         df = pd.read_csv(latest)
-        pwm, current, speed = df['PWM'].values, df['Current_A'].values, df['Omega'].values
-        v_bus = df['Voltage'].values if 'Voltage' in df else np.full(len(df), 12.0)
-        
-        v_supply = round(float(v_bus[pwm == pwm.max()].mean()), 3)
-        if v_supply < 1.0: v_supply = 12.0
-        
-        acceleration = np.abs(np.diff(speed, prepend=speed[0])) / 0.01
-        steady = (pwm > 50) & (acceleration < 2.0)
-        A = np.vstack([current[steady], speed[steady]]).T
-        b_vec = v_supply * (pwm[steady] / 255.0)
-        
-        (R_cal, Ke_cal), _ = nnls(A, b_vec)
-        R_cal, Ke_cal = max(R_cal, 1.0), max(Ke_cal, 0.01)
-        
-        # Зменшуємо Ts, щоб симуляція гарантовано рушала з місця
+        pwm      = df['PWM'].values.astype(float)
+        current  = df['Current_A'].values.astype(float)
+        speed    = df['Omega'].values.astype(float)
+        voltage  = df['Voltage'].values.astype(float)
+
+        # Оцінка кроку дискретизації
+        dt_est = 0.01
+        try:
+            ts = pd.to_datetime(df['Timestamp'])
+            dts = ts.diff().dt.total_seconds().dropna().values
+            if len(dts) > 0:
+                med = float(np.median(dts))
+                if 1e-5 < med < 1.0:
+                    dt_est = med
+        except Exception:
+            pass
+
+        acceleration = np.abs(np.diff(speed, prepend=speed[0])) / dt_est
+        steady_fwd = (
+            (speed > 0.5) &
+            (current > 0.01) &
+            (pwm > 20) &
+            (acceleration < 2.0) &
+            (voltage > 1.0) &
+            np.isfinite(voltage) & np.isfinite(current) & np.isfinite(speed)
+        )
+        n_fwd = int(np.count_nonzero(steady_fwd))
+        if n_fwd < 10:
+            print(f"⚠️ Мало forward-steady точок ({n_fwd}). "
+                  f"Послаблюємо умови.")
+            steady_fwd = (
+                (speed > 0.1) &
+                (pwm > 10) &
+                (acceleration < 5.0) &
+                (voltage > 0.5) &
+                np.isfinite(voltage) & np.isfinite(current) & np.isfinite(speed)
+            )
+            n_fwd = int(np.count_nonzero(steady_fwd))
+            if n_fwd < 5:
+                raise RuntimeError(
+                    f"Недостатньо forward-точок ({n_fwd}). Потрібен сценарій "
+                    f"з розгоном у прямому напрямку. Запустіть спочатку "
+                    f"collect на scenario.txt або scenario-stress.txt."
+                )
+
+        A = np.column_stack([current[steady_fwd], speed[steady_fwd]])
+        b_vec = voltage[steady_fwd]  # u — виміряна напруга мотора
+
+        # Відкидаємо занадто близькі до нуля b_vec (шум)
+        mask = b_vec > 0.01
+        if mask.sum() < 5:
+            raise RuntimeError("b_vec містить занадто мало додатних значень.")
+        A, b_vec = A[mask], b_vec[mask]
+
+        from scipy.optimize import minimize
+
+        def _objective(x):
+            R, Ke = x
+            return float(np.sum((R * A[:, 0] + Ke * A[:, 1] - b_vec) ** 2))
+
+        res = minimize(
+            _objective,
+            x0=[5.0, 0.5],
+            bounds=[(2.0, 30.0), (0.15, 0.80)],
+            method="L-BFGS-B",
+        )
+        R_cal, Ke_cal = float(res.x[0]), float(res.x[1])
+        if R_cal < 2.0:
+            print(f"⚠️ R={R_cal:.3f} < 2 Ом — підозріло. Перевірте, "
+            f"що INA219 вимірює напругу в правильній точці.")
+        residual_l2 = float(np.sqrt(max(res.fun, 0.0)))
+        print(f"⚡ Електрика: R={R_cal:.4f} Ом, Ke={Ke_cal:.5f} "
+      f"(residual={residual_l2:.3f}, точок={len(b_vec)})")
+
+        pwm_max = float(pwm[steady_fwd].max()) if n_fwd > 0 else float(pwm.max())
+
+        if pwm_max >= 220:
+            high_mask = (pwm > 220) & (speed > 1.0) & np.isfinite(voltage)
+            if high_mask.sum() >= 3:
+                v_supply = round(float(voltage[high_mask].max()), 3)
+            else:
+                v_supply = round(float(np.nanmax(voltage[steady_fwd])), 3)
+            print(f"⚡ V_supply (з PWM≥220): {v_supply} В")
+        else:
+            # Лінійна регресія на forward-steady: u = a*pwm + c
+            from scipy.stats import linregress
+            x = pwm[steady_fwd]
+            y = voltage[steady_fwd]
+            ok = np.isfinite(x) & np.isfinite(y) & (y > 0.5)
+            if ok.sum() >= 10:
+                slope, intercept, _, _, _ = linregress(x[ok], y[ok])
+                v_supply = round(float(slope * 255.0 + intercept), 3)
+                print(f"⚡ V_supply (екстраполяція з PWM_max={pwm_max:.0f}): "
+                      f"{v_supply} В  [похибка через L298N drop, "
+                      f"краще w=21]")
+            else:
+                v_supply = 12.0
+                print(f"⚠️ Замало точок для регресії, V_supply = 12 В (номінал).")
+
+        if v_supply < 1.0:
+            v_supply = 12.0
+        # Захист від явно неправильних значень
+        if v_supply > 14.0:
+            print(f"⚠️ V_supply={v_supply} В > 14 В — обмежено 14 В.")
+            v_supply = 14.0
+
+        try:
+            n = len(current)
+            if n < 50:
+                raise ValueError(f"мало даних ({n})")
+
+            acc = np.gradient(speed, dt_est)
+            valid = (
+                (np.abs(speed) > 0.5) &
+                (np.abs(current) > 0.01) &
+                (np.abs(current) < 3.0) &
+                (np.abs(acc) < 100.0) &
+                np.isfinite(acc) & np.isfinite(current) & np.isfinite(speed)
+            )
+            n_valid = int(np.count_nonzero(valid))
+            if n_valid < 30:
+                raise ValueError(f"мало валідних точок ({n_valid})")
+
+            # Діагностика: чи струм знаковий?
+            # Якщо при від'ємній швидкості струм переважно додатний —
+            # PowerMonitor інвертує за dir, механіка буде недостовірною.
+            neg_speed_mask = speed[valid] < -0.5
+            if neg_speed_mask.sum() > 0:
+                mean_neg_i = float(np.mean(current[valid][neg_speed_mask]))
+                if mean_neg_i > 0.05:
+                    print(f"⚠️ Струм при реверсі додатний "
+                          f"(mean={mean_neg_i:.3f}). "
+                          f"PowerMonitor інвертує за dir — "
+                          f"виправте його для достовірної механіки.")
+
+            A_mech = np.column_stack([
+                acc[valid],
+                np.sign(speed[valid]),
+                speed[valid]
+            ])
+            b_mech = Ke_cal * current[valid]
+
+            cond_num = float(np.linalg.cond(A_mech))
+            if cond_num > 1e6:
+                print(f"⚠️ Погана обумовленість механічної матриці "
+                      f"(cond={cond_num:.1e}) — дефолти.")
+                J_cal, b_cal, Ts_cal = 0.001, 1e-06, 0.05
+            else:
+                (J_cal, Ts_cal, b_cal), _ = nnls(A_mech, b_mech)
+                J_cal  = float(np.clip(J_cal,  1e-5, 0.1))
+                b_cal  = float(np.clip(b_cal,  1e-8, 0.01))
+                Ts_cal = float(np.clip(Ts_cal, 0.0,  0.5))
+                print(f"⚙️ Механіка: J={J_cal:.6f}, b={b_cal:.2e}, "
+                      f"Ts={Ts_cal:.4f} (cond={cond_num:.1e})")
+        except Exception as e:
+            print(f"⚠️ Механічна ідентифікація пропущена: {e}")
+            J_cal, b_cal, Ts_cal = 0.001, 1e-06, 0.05
+
         params = {
             "hardware": {"supply_voltage": v_supply},
             "motor_parameters": {
-                "R": round(R_cal, 3), "L": 0.01, "Ke": round(Ke_cal, 5), 
-                "Km": round(Ke_cal, 5), "J": 0.001, "b": 1e-06, "Ts": 0.05 
+                "R":  round(R_cal, 4), "L": 0.01,
+                "Ke": round(Ke_cal, 5), "Km": round(Ke_cal, 5),
+                "J":  round(J_cal, 6),  "b":  round(b_cal, 8),
+                "Ts": round(Ts_cal, 4), "Rd": 0.05
             }
         }
-        with open(Config.CONFIG_FILE, "w") as f: json.dump(params, f, indent=4)
-        print(f"✅ Двійник відкалібровано! V_supply={v_supply}V, R={R_cal:.3f} Ом, Ke={Ke_cal:.4f}")
+        with open(Config.CONFIG_FILE, 'w') as f:
+            json.dump(params, f, indent=4)
+        print(f"✅ Двійник відкалібровано: "
+              f"R={R_cal:.4f} Ом, Ke={Ke_cal:.5f}, "
+              f"V_supply={v_supply} В, "
+              f"J={J_cal:.6f}, b={b_cal:.2e}, Ts={Ts_cal:.4f}")
+
+def _de_objective(g, twin, target, penalty):
+    kp, ki, kd = g
+    T_sim = 4.0 if target > 15 else (3.0 if target > 8 else 2.5)   # ← додати
+    total = 0.0
+    for frac in (0.0, 0.5):
+        x0 = target * frac
+        iae, over = twin.simulate_closed_loop(
+            target, kp, ki, kd, x0=x0, T=T_sim                         # ← T=T_sim
+        )
+        pen = (over - 15.0) * penalty if over > 15.0 else 0.0
+        total += iae + pen
+    return total / 2.0
 
 class AITrainer:
     @staticmethod
-    def run(max_target: float = 15.0): # Дефолт 15.0, бо 21 недосяжне
+    def run(max_target: float = 21.0):
+        Config.ensure_dirs()
         import tensorflow as tf
         from tensorflow.keras import layers, models
 
@@ -319,26 +519,29 @@ class AITrainer:
         bounds = [Config.BOUNDS_KP, Config.BOUNDS_KI, Config.BOUNDS_KD]
         X, Y = [], []
         
+        if not 3.0 <= max_target <= 21.0:
+            raise ValueError("max_target має бути в діапазоні 3..21 рад/с згідно з документацією.")
         targets = np.linspace(3.0, max_target, 13) 
         
         for i, target in enumerate(targets):
             print(f"  Оптимізація для {target:.1f} рад/с ({i+1}/{len(targets)})")
-            def obj(g): 
-                # Усереднюємо IAE за трьома стартовими станами
-                total = 0.0
-                for frac in (0.0, 0.25, 0.5):
-                    x0 = target * frac
-                    iae, over = twin.simulate_closed_loop(target, *g, x0=x0)
-                    penalty = (over - 15.0) * Config.PENALTY_OVERSHOOT if over > 15.0 else 0.0
-                    total += iae + penalty
-                return total / 3.0
-            
-            # Фіксуємо seed для відтворюваності
-            res = differential_evolution(obj, bounds, maxiter=10, popsize=8, seed=42+i)
-            
+            from functools import partial
+
+            T_sim = 4.0 if target > 15 else (3.0 if target > 8 else 2.5)  # п.3
+            obj = partial(_de_objective, twin=twin, target=target,
+                        penalty=Config.PENALTY_OVERSHOOT)
+
+            res = differential_evolution(
+                obj, bounds,
+                maxiter=7, popsize=6, seed=42+i,
+                workers=-1, updating='deferred',
+            )
+
             # Додаємо різні початкові швидкості (x0) для наукової новизни
-            for _ in range(40):
-                x0 = np.random.uniform(0, target * 0.5) 
+            for _ in range(60):
+                # Навчальні приклади охоплюють як розгін, так і гальмування
+                # (від'ємну похибку), а не лише початкову позитивну похибку.
+                x0 = np.random.uniform(0.0, target * 1.25)
                 err = target - x0
                 X.append([target, err])
                 Y.append(res.x)
@@ -396,7 +599,10 @@ class AITrainer:
 class HILController:
     @staticmethod
     def run(target_speed: float, port: Optional[str] = None, auto_plot: bool = False, static_mode: bool = False, tag: str = "ai", scenario_file: Optional[str] = None):
+        Config.ensure_dirs()
         import tensorflow as tf
+
+        target_speed = float(np.clip(target_speed, -Config.MAX_TARGET_ABS, Config.MAX_TARGET_ABS))
         
         if not Config.MODEL_FILE.exists(): 
             print("❌ Модель не знайдена."); return
@@ -417,9 +623,10 @@ class HILController:
                 writer.writerow(["Timestamp", "Current_A", "Voltage", "Omega", "Target", "PWM", "Kp", "Ki", "Kd"])
                 
                 print(f"🚀 HIL-тест ({mode_name}): Ціль: {target_speed} рад/с")
-                R_cal, Ke_cal = Config.get_calibrated_pbc_params()
+                R_cal, Ke_cal, Rd_cal = Config.get_calibrated_pbc_params()
                 hw.send(f"r {R_cal:.4f}")
                 hw.send(f"ke {Ke_cal:.5f}")
+                hw.send(f"rd {Rd_cal:.4f}")
                 time.sleep(0.1)
                 hw.send("cfreq 100")
                 
@@ -448,10 +655,21 @@ class HILController:
                                 print(f"⚠️ Помилка паузи: {e}")
                             continue
                             
-                        if line.lower() == "stop_all": 
+                        if line.lower() == "stop_all":
                             print("🏁 Знайдено stop_all.")
                             break
-                            
+
+                        if line.lower().startswith("w "):
+                            try:
+                                tgt = float(line.split()[1])
+                                tgt = float(np.clip(tgt,
+                                                    -Config.MAX_TARGET_ABS,
+                                                    Config.MAX_TARGET_ABS))
+                                line = f"w {tgt:.3f}"
+                            except Exception as e:
+                                print(f"⚠️ Некоректна w-команда '{line}': {e}")
+                                continue
+
                         print(f"➡️ Відправка: {line}")
                         hw.send(line)
                         time.sleep(0.05)
@@ -480,9 +698,11 @@ class HILController:
                             if need_update and target != 0:
                                 try:
                                     error = target - omega
-                                    # ЗАХИСТ: Нейромережа не знає від'ємних швидкостей, передаємо модулі
-                                    nn_target = np.clip(abs(target), 3.0, 18.0)
-                                    nn_error = np.clip(abs(error), -6.0, 6.0)
+                                    # Симетричне перетворення для моделі, навченої на
+                                    # додатних швидкостях; знак похибки зберігається.
+                                    direction = 1.0 if target >= 0 else -1.0
+                                    nn_target = np.clip(abs(target), 3.0, 21.0)
+                                    nn_error = np.clip(direction * error, -6.0, 6.0)
                                     
                                     X = np.array([[nn_target, nn_error]])
                                     X_n = (X - scaler['X_mean']) / np.where(scaler['X_std'] == 0, 1, scaler['X_std'])
@@ -490,7 +710,8 @@ class HILController:
                                     
                                     kp, ki, kd = np.clip(Y[0], [Config.BOUNDS_KP[0], Config.BOUNDS_KI[0], Config.BOUNDS_KD[0]], [Config.BOUNDS_KP[1], Config.BOUNDS_KI[1], Config.BOUNDS_KD[1]])
                                     
-                                    if np.isnan(kp): raise ValueError("AI returned NaN")
+                                    if not np.all(np.isfinite([kp, ki, kd])):
+                                        raise ValueError("AI повернула NaN або нескінченне значення")
                                         
                                     hw.send(f"kp {kp:.3f}"); hw.send(f"ki {ki:.3f}"); hw.send(f"kd {kd:.5f}")
                                     print(f"[{mode_name}] Target: {target:4.1f} | Error: {error:5.2f} | Kp={kp:.3f}, Ki={ki:.3f}")
@@ -546,8 +767,10 @@ class Analyzer:
             axs[3].plot(t, df['Kd'] * 100, 'y--', label='Kd × 100')
             axs[3].set_ylabel('Коефіцієнти'); axs[3].set_xlabel('Час (с)'); axs[3].legend(); axs[3].grid(True)
         
-        plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
-        print(f"✅ Графік збережено: {save_path}")
+        output = Path(save_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        plt.tight_layout(); plt.savefig(output, dpi=150); plt.close()
+        print(f"✅ Графік збережено: {output}")
 
     @staticmethod
     def compare(file1: str, file2: str, save_path: str = "logs/comparison.png"):
@@ -566,15 +789,74 @@ class Analyzer:
         ax2.plot(t_a, df_a['PWM'], 'g-', label='AI')
         ax2.set_ylabel('ШІМ'); ax2.set_xlabel('Час (с)'); ax2.legend(); ax2.grid(True)
         
-        plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
-        print(f"✅ Порівняльний графік збережено: {save_path}")
+        output = Path(save_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        plt.tight_layout(); plt.savefig(output, dpi=150); plt.close()
+        print(f"✅ Порівняльний графік збережено: {output}")
 
 class ReportGenerator:
+    @staticmethod
+    def _overshoot_by_transitions(target, omega,
+                                threshold=0.5, min_samples=20):
+        target = np.asarray(target, dtype=float)
+        omega = np.asarray(omega, dtype=float)
+        if len(target) < 2:
+            return 0.0
+
+        diffs = np.abs(np.diff(target))
+        change_idx = np.where(diffs > threshold)[0]
+
+        # Одна цільова точка (плоский Target)
+        if len(change_idx) == 0:
+            tgt = target[-1]
+            if abs(tgt) < 1e-6:
+                return 0.0
+            if tgt > 0:
+                return float(max(0.0, (omega.max() - tgt) / abs(tgt) * 100.0))
+            else:
+                return float(max(0.0, (tgt - omega.min()) / abs(tgt) * 100.0))
+
+        boundaries = [0] + [c + 1 for c in change_idx] + [len(target)]
+
+        max_os = 0.0
+        for k in range(len(boundaries) - 1):
+            start = boundaries[k]
+            end = boundaries[k + 1]
+            if end - start < min_samples:
+                continue
+
+            new_tgt = target[end - 1]
+            if abs(new_tgt) < 1e-6:
+                continue
+
+            # old_tgt — ціль ДО переходу (для першого сегмента — 0)
+            if start > 0:
+                old_tgt = float(target[start - 1])
+            else:
+                old_tgt = 0.0
+
+            seg = omega[start:end]
+
+            if new_tgt > old_tgt + 0.1:
+                peak = float(seg.max())
+                os_val = max(0.0, (peak - new_tgt) / abs(new_tgt) * 100.0)
+            elif new_tgt < old_tgt - 0.1:
+                valley = float(seg.min())
+                os_val = max(0.0, (new_tgt - valley) / abs(new_tgt) * 100.0)
+            else:
+                os_val = 0.0
+
+            max_os = max(max_os, os_val)
+        return float(max_os)
+
     @staticmethod
     def create_multi_scenario_pdf(data_list: list, save_path: str = "logs/Final_Multi_Report.pdf"):
         import platform
         from fpdf import FPDF 
         
+        Config.ensure_dirs()
+        output = Path(save_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
         pdf = FPDF()
         font_path = "C:/Windows/Fonts/arial.ttf" if platform.system() == "Windows" else "DejaVuSans.ttf"
         
@@ -586,60 +868,74 @@ class ReportGenerator:
             pdf.set_font("Helvetica", size=20)
             
         pdf.ln(60)
-        pdf.cell(200, 20, txt="ЗВІТ ПРО РЕЗУЛЬТАТИ HIL-ДОСЛІДЖЕННЯ", ln=True, align='C')
+        pdf.cell(200, 20, text="ЗВІТ ПРО РЕЗУЛЬТАТИ HIL-ДОСЛІДЖЕННЯ", new_x="LMARGIN", new_y="NEXT", align='C')
         pdf.set_font("Arial", size=14)
-        pdf.cell(200, 10, txt="Порівняння Baseline, Hybrid та Dynamic AI", ln=True, align='C')
+        pdf.cell(200, 10, text="Порівняння Baseline, Hybrid та Dynamic AI", new_x="LMARGIN", new_y="NEXT", align='C')
 
         def crop_active_phase(df):
-            """Обрізає лог до активної фази та повертає (df, t)."""
-            active_idx = df[df['Target'] != 0].index
-            if len(active_idx) == 0:
-                # FIX: повертаємо кортеж, а не один df
-                t = (pd.to_datetime(df['Timestamp']) - pd.to_datetime(df['Timestamp']).iloc[0]).dt.total_seconds().values
+            if len(df) == 0 or 'Timestamp' not in df.columns:
+                return df.copy().reset_index(drop=True), np.array([0.0])
+
+            nonzero = df[df['Target'] != 0].index
+            if len(nonzero) == 0:
+                t = (pd.to_datetime(df['Timestamp'])
+                    - pd.to_datetime(df['Timestamp']).iloc[0]
+                    ).dt.total_seconds().values
                 return df.copy().reset_index(drop=True), t
-            
-            start_idx = active_idx[0]
-            end_idx = min(active_idx[-1] + 100, len(df) - 1)
-            
+            start_idx = nonzero[0]
+            end_idx = min(nonzero[-1] + 100, len(df) - 1)
             cropped = df.iloc[start_idx:end_idx].copy().reset_index(drop=True)
-            t = (pd.to_datetime(cropped['Timestamp']) - pd.to_datetime(cropped['Timestamp']).iloc[0]).dt.total_seconds().values
+            t = (pd.to_datetime(cropped['Timestamp'])
+                - pd.to_datetime(cropped['Timestamp']).iloc[0]
+                ).dt.total_seconds().values
             return cropped, t
         
+        def _fmt(v, prec=2, suffix=""):
+            if v is None or not np.isfinite(v):
+                return "n/a"
+            return f"{v:.{prec}f}{suffix}"
+        
         def calc_metrics(df):
+            if len(df) == 0 or 'Target' not in df.columns:
+                return float('nan'), float('nan'), float('nan')
             cropped, t = crop_active_phase(df)
-            
-            # IAE та overshoot — як раніше
+            if len(cropped) == 0 or len(t) < 2:
+                return float('nan'), float('nan'), float('nan')
             error = cropped['Target'].values - cropped['Omega'].values
             iae = np.trapezoid(np.abs(error), x=t)
-            target_max = cropped['Target'].max()
-            if abs(target_max) < 1e-9:
-                return 0.0, 0.0, 0.0
-            overshoot = max(0, (cropped['Omega'].max() - target_max) / abs(target_max) * 100)
-            
-            # FIX: статична похибка — на сталій ділянці ПЕРЕД останньою зміною цілі
+            if abs(cropped['Target'].max()) < 1e-9:
+                return float('nan'), float('nan'), float('nan')
+
+            overshoot = ReportGenerator._overshoot_by_transitions(
+                cropped['Target'].values, cropped['Omega'].values)
+
+            # Статична похибка на ОСТАННІЙ сталій ділянці перед зміною цілі
             target_arr = cropped['Target'].values
-            nonzero_mask = target_arr != 0
-            if nonzero_mask.sum() == 0:
+            diffs = np.abs(np.diff(target_arr))
+            changes = np.where(diffs > 0.5)[0]
+            if len(changes) == 0:
+                seg_start, seg_end = 0, len(target_arr)
+            else:
+                last_change = changes[-1]
+                # від останньої зміни до кінця — це останнє плато (якщо довге)
+                if len(target_arr) - last_change > 100:
+                    seg_start, seg_end = last_change + 1, len(target_arr)
+                else:
+                    seg_start, seg_end = changes[-2] + 1 if len(changes) > 1 else 0, last_change
+            seg_t = target_arr[seg_start:seg_end]
+            if len(seg_t) == 0 or abs(np.median(seg_t)) < 1e-6:
                 return iae, overshoot, 0.0
-            
-            last_nonzero = np.where(nonzero_mask)[0][-1]
-            # Беремо ділянку від 70% до 95% активної частини (пропускаємо хвіст при гальмуванні)
-            active_len = last_nonzero + 1
-            start_ss = int(active_len * 0.7)
-            end_ss = int(active_len * 0.95)
-            if end_ss <= start_ss:
-                start_ss, end_ss = 0, active_len
-            
-            steady_err = np.mean(np.abs(
-                cropped['Target'].values[start_ss:end_ss] - cropped['Omega'].values[start_ss:end_ss]
-            ))
-            
+            start_ss = seg_start + int(len(seg_t) * 0.7)
+            end_ss = seg_start + int(len(seg_t) * 0.95)
+            steady_err = float(np.mean(np.abs(
+                cropped['Target'].values[start_ss:end_ss]
+                - cropped['Omega'].values[start_ss:end_ss])))
             return iae, overshoot, steady_err
 
         for idx, data in enumerate(data_list):
             pdf.add_page()
             pdf.set_font("Arial", size=14)
-            pdf.cell(200, 10, txt=f"Сценарій: {data['name']}", ln=True)
+            pdf.cell(200, 10, text=f"Сценарій: {data['name']}", new_x="LMARGIN", new_y="NEXT")
             pdf.ln(5)
 
             df_b, df_h, df_a = pd.read_csv(data['baseline']), pd.read_csv(data['hybrid']), pd.read_csv(data['ai'])
@@ -649,28 +945,28 @@ class ReportGenerator:
             iae_a, os_a, ss_a = calc_metrics(df_a)
 
             pdf.set_font("Arial", size=10)
-            pdf.cell(50, 10, txt="Метрика", border=1, align='C')
-            pdf.cell(45, 10, txt="Baseline", border=1, align='C')
-            pdf.cell(45, 10, txt="Hybrid", border=1, align='C')
-            pdf.cell(45, 10, txt="Dynamic AI", border=1, align='C')
+            pdf.cell(50, 10, text="Метрика", border=1, align='C')
+            pdf.cell(45, 10, text="Baseline", border=1, align='C')
+            pdf.cell(45, 10, text="Hybrid", border=1, align='C')
+            pdf.cell(45, 10, text="Dynamic AI", border=1, align='C')
             pdf.ln()
             
-            pdf.cell(50, 10, txt="IAE (Інтеграл)", border=1)
-            pdf.cell(45, 10, txt=f"{iae_b:.2f}", border=1, align='C')
-            pdf.cell(45, 10, txt=f"{iae_h:.2f}", border=1, align='C')
-            pdf.cell(45, 10, txt=f"{iae_a:.2f}", border=1, align='C')
+            pdf.cell(50, 10, text="IAE (Інтеграл)", border=1)
+            pdf.cell(45, 10, text=_fmt(iae_b), border=1, align='C')
+            pdf.cell(45, 10, text=_fmt(iae_h), border=1, align='C')
+            pdf.cell(45, 10, text=_fmt(iae_a), border=1, align='C')
             pdf.ln()
             
-            pdf.cell(50, 10, txt="Перерегулювання", border=1)
-            pdf.cell(45, 10, txt=f"{os_b:.1f}%", border=1, align='C')
-            pdf.cell(45, 10, txt=f"{os_h:.1f}%", border=1, align='C')
-            pdf.cell(45, 10, txt=f"{os_a:.1f}%", border=1, align='C')
+            pdf.cell(50, 10, text="Перерегулювання", border=1)
+            pdf.cell(45, 10, text=_fmt(os_b, prec=1, suffix="%"), border=1, align='C')
+            pdf.cell(45, 10, text=_fmt(os_h, prec=1, suffix="%"), border=1, align='C')
+            pdf.cell(45, 10, text=_fmt(os_a, prec=1, suffix="%"), border=1, align='C')
             pdf.ln()
             
-            pdf.cell(50, 10, txt="Стат. похибка", border=1)
-            pdf.cell(45, 10, txt=f"{ss_b:.2f}", border=1, align='C')
-            pdf.cell(45, 10, txt=f"{ss_h:.2f}", border=1, align='C')
-            pdf.cell(45, 10, txt=f"{ss_a:.2f}", border=1, align='C')
+            pdf.cell(50, 10, text="Стат. похибка", border=1)
+            pdf.cell(45, 10, text=_fmt(ss_b, prec=2), border=1, align='C')
+            pdf.cell(45, 10, text=_fmt(ss_h, prec=2), border=1, align='C')
+            pdf.cell(45, 10, text=_fmt(ss_a, prec=2), border=1, align='C')
             pdf.ln(15)
 
             # Малюємо ОБРІЗАНІ графіки
@@ -696,8 +992,8 @@ class ReportGenerator:
             pdf.image(str(chart_path), x=15, w=180)
             os.remove(chart_path)
 
-        pdf.output(save_path)
-        print(f"✅ Звіт збережено: {save_path}")
+        pdf.output(str(output))
+        print(f"✅ Звіт збережено: {output}")
 
 # ============================================================================
 # 5. ГОЛОВНИЙ КОНТРОЛЕР
@@ -715,7 +1011,8 @@ if __name__ == "__main__":
     subs.add_parser("calibrate")
 
     p_train = subs.add_parser("train")
-    p_train.add_argument("--max-target", type=float, default=15.0, help="Фізична межа N20 - близько 18 рад/с")
+    p_train.add_argument("--max-target", type=float, default=21.0,
+                         help="Діапазон навчання 3..21 рад/с згідно з документацією")
 
     p_ai = subs.add_parser("ai")
     p_ai.add_argument("--port", default=None)
@@ -770,5 +1067,7 @@ if __name__ == "__main__":
             }
         ]
         data_list = [d for d in data_list if all(d.values())]
-        if data_list: ReportGenerator.create_multi_scenario_pdf(data_list, "logs/FINAL_THESIS_REPORT.pdf")
+        if data_list:
+            Config.ensure_dirs()
+            ReportGenerator.create_multi_scenario_pdf(data_list, str(Config.LOGS_DIR / "FINAL_THESIS_REPORT.pdf"))
         else: print("❌ Не знайдено повних наборів даних.")

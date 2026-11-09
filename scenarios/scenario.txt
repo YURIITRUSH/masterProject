@@ -11,6 +11,9 @@ tfreq 100
 w 15
 wait 8
 
+w 5
+wait 4
+
 # ЗАВЕРШЕННЯ
 s
 stop_all

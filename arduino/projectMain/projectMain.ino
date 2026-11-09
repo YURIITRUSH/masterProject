@@ -170,15 +170,10 @@ public:
     bool begin() { _isOnline = _ina219.begin(); return _isOnline; }
 
     void update(MotorDriver::Direction dir, float dt) {
+        (void)dir;
         if (!_isOnline || dt <= 0.001f) return;
-
-        float raw_i = -_ina219.getCurrent_mA() / 1000.0f;
-        float i = raw_i;
-        if (dir == MotorDriver::Direction::BACKWARD) {
-            i = -raw_i;
-        }
+        float i = _ina219.getCurrent_mA() / 1000.0f;
         float v = _ina219.getBusVoltage_V();
-
         float alpha = 1.0f - expf(-dt / Config::CURRENT_FILTER_TAU);
         if (alpha > 1.0f) alpha = 1.0f;
         if (alpha < 0.0f) alpha = 0.0f;
@@ -225,7 +220,8 @@ public:
     void beginTarget(float newTarget, float currentOmega, int currentPwmOut) {
         resetDynamics();
         _prev_e = newTarget - currentOmega;
-        current_pwm = static_cast<float>(currentPwmOut);
+        bool same_sign = (newTarget >= 0) == (currentPwmOut >= 0) || currentPwmOut == 0;
+        current_pwm = same_sign ? static_cast<float>(currentPwmOut) : 0.0f;
         target_omega = newTarget;
         is_active = true;
     }
@@ -244,7 +240,7 @@ public:
         if (fabsf(e) < 6.0f) {
             _z = constrain(_z + Ki * e * dt, -I_MAX, I_MAX);
         } else {
-            _z *= expf(-dt / 0.3f);
+            _z *= expf(-dt / 0.2f);
         }
 
         // D-складова з фільтром
@@ -366,25 +362,25 @@ private:
 
     void printStatus() {
         Serial.println(F("\n--- STATUS ---"));
-        Serial.print(F("PBC Active:   ")); Serial.println(_pbc.is_active ? F("YES") : F("NO"));
-        Serial.print(F("Target:       ")); Serial.print(_pbc.target_omega, 2); Serial.println(F(" rad/s"));
-        Serial.print(F("Omega:        ")); Serial.print(_encoder.getOmega(), 2); Serial.println(F(" rad/s"));
-        Serial.print(F("Voltage:      ")); Serial.print(_power.getVoltageVolts(), 2); Serial.println(F(" V"));
-        Serial.print(F("INA219:       ")); Serial.println(_power.isOnline() ? F("ONLINE") : F("OFFLINE"));
-        Serial.print(F("Current:      ")); Serial.print(_power.getCurrentAmps(), 3); Serial.println(F(" A"));
-        Serial.print(F("PWM:          ")); Serial.println(_motor.getSpeed());
-        Serial.print(F("ISR count:    ")); Serial.println(_encoder.getIsrCount());
-        Serial.print(F("Raw ticks:    ")); Serial.println(_encoder.getRawTicks());
-        Serial.print(F("Last dTicks:  ")); Serial.println(_encoder.getLastDelta());
-        Serial.print(F("Raw omega:    ")); Serial.print(_encoder.getRawOmega(), 3); Serial.println(F(" rad/s"));
-        Serial.print(F("Ctrl freq:    ")); Serial.print(1000.0f / Config::control_interval_ms, 1);
-        Serial.print(F(" Hz (")); Serial.print(Config::control_interval_ms); Serial.println(F(" ms)"));
-        Serial.print(F("Telem freq:   ")); Serial.print(1000.0f / Config::telemetry_interval_ms, 1);
-        Serial.print(F(" Hz (")); Serial.print(Config::telemetry_interval_ms); Serial.println(F(" ms)"));
-        Serial.print(F("Kp / Ki / Kd: ")); Serial.print(_pbc.Kp, 3);
+        Serial.print(F("- PBC Active:   ")); Serial.println(_pbc.is_active ? F("YES") : F("NO"));
+        Serial.print(F("- Target:       ")); Serial.print(_pbc.target_omega, 2); Serial.println(F(" rad/s"));
+        Serial.print(F("- Omega:        ")); Serial.print(_encoder.getOmega(), 2); Serial.println(F(" rad/s"));
+        Serial.print(F("- Voltage:      ")); Serial.print(_power.getVoltageVolts(), 2); Serial.println(F(" V"));
+        Serial.print(F("- INA219:       ")); Serial.println(_power.isOnline() ? F("ONLINE") : F("OFFLINE"));
+        Serial.print(F("- Current:      ")); Serial.print(_power.getCurrentAmps(), 3); Serial.println(F(" A"));
+        Serial.print(F("- PWM:          ")); Serial.println(_motor.getSpeed());
+        Serial.print(F("- ISR count:    ")); Serial.println(_encoder.getIsrCount());
+        Serial.print(F("- Raw ticks:    ")); Serial.println(_encoder.getRawTicks());
+        Serial.print(F("- Last dTicks:  ")); Serial.println(_encoder.getLastDelta());
+        Serial.print(F("- Raw omega:    ")); Serial.print(_encoder.getRawOmega(), 3); Serial.println(F(" rad/s"));
+        Serial.print(F("- Ctrl freq:    ")); Serial.print(1000.0f / Config::control_interval_ms, 1);
+        Serial.print(F("- Hz (")); Serial.print(Config::control_interval_ms); Serial.println(F(" ms)"));
+        Serial.print(F("-Telem freq:   ")); Serial.print(1000.0f / Config::telemetry_interval_ms, 1);
+        Serial.print(F("- Hz (")); Serial.print(Config::telemetry_interval_ms); Serial.println(F(" ms)"));
+        Serial.print(F("- Kp / Ki / Kd: ")); Serial.print(_pbc.Kp, 3);
         Serial.print(F(" / ")); Serial.print(_pbc.Ki, 3);
         Serial.print(F(" / ")); Serial.println(_pbc.Kd, 3);
-        Serial.print(F("ke / R / Rd:  ")); Serial.print(_pbc.ke, 3);
+        Serial.print(F("- ke / R / Rd:  ")); Serial.print(_pbc.ke, 3);
         Serial.print(F(" / ")); Serial.print(_pbc.R, 2);
         Serial.print(F(" / ")); Serial.println(_pbc.Rd, 3);
         Serial.println(F("--------------\n"));
@@ -533,28 +529,29 @@ void loop() {
 
         if (pbc.is_active) {
             float u = pbc.computeVoltage(power.getCurrentAmps(), encoder.getOmega(), dt);
-            float vSupply = (power.isOnline() && power.getVoltageVolts() > 1.0f)
-                            ? power.getVoltageVolts() : Config::MAX_VOLTAGE;
+
+            const float vSupply = Config::MAX_VOLTAGE;   // 12.0f
+
             float duty = constrain(fabsf(u) / vSupply, 0.0f, 1.0f);
             float target_pwm = duty * 255.0f;
 
-            // Slew Rate Limiter — time-based
+            float signed_target = (u > 0.0f ? 1.0f : -1.0f) * target_pwm;
             float max_delta = Config::SLEW_RATE_PWM_PER_SEC * dt;
-            if (target_pwm > pbc.current_pwm + max_delta)       pbc.current_pwm += max_delta;
-            else if (target_pwm < pbc.current_pwm - max_delta)  pbc.current_pwm -= max_delta;
-            else                                                pbc.current_pwm = target_pwm;
+            if (signed_target > pbc.current_pwm + max_delta)
+                pbc.current_pwm += max_delta;
+            else if (signed_target < pbc.current_pwm - max_delta)
+                pbc.current_pwm -= max_delta;
+            else
+                pbc.current_pwm = signed_target;
 
-            int pwm_out = (int)pbc.current_pwm;
+            int pwm_out = (int)fabsf(pbc.current_pwm);
 
-            if (u > 0.01f) {
+            if (pbc.current_pwm > 0.5f) {
                 motor.drive(MotorDriver::Direction::FORWARD, pwm_out);
-            }
-            else if (u < -0.01f) {
+            } else if (pbc.current_pwm < -0.5f) {
                 motor.drive(MotorDriver::Direction::BACKWARD, pwm_out);
-            }
-            else {
+            } else {
                 motor.stop();
-                pbc.current_pwm = 0.0f;
             }
         }
     }
